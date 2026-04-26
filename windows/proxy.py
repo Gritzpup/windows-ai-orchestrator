@@ -1,224 +1,184 @@
+"""
+Windows AI Proxy - port 9000
+Routes Ollama requests to WSL, auto-resizes large vision images.
+Silent: uses CREATE_NO_WINDOW to suppress all subprocess windows.
+"""
+import subprocess, json, base64, os, tempfile, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import subprocess, json, time, re, base64
 from socketserver import ThreadingMixIn
 
-OLLAMA_WSL_CMD = ['wsl', 'curl', '-s', '--max-time', '900']
-COMFYUI_PY = r'C:\Users\Joshua\AppData\Roaming\StabilityMatrix\Packages\ComfyUI\venv\Scripts\python.exe'
-RESIZE_SCRIPT = r'C:\Users\Joshua\resize_vision.py'
+COMFYUI_PYW = r'C:\Users\Joshua\AppData\Roaming\StabilityMatrix\Packages\ComfyUI\venv\Scripts\python.exe'
+MAX_VISION = 50_000  # bytes - resize images larger
+CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
-def resize_image(image_data, max_size=200):
-    """Resize image using ComfyUI venv PIL, return base64 of resized image."""
+
+def curl_wsl(url, data=None):
+    """Call WSL Ollama silently. Pass body via Windows temp file."""
+    tmp_win = None
     try:
-        import struct, tempfile, os
-        # Write original image to temp file
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False, mode='wb') as f:
-            f.write(image_data)
-            tmp_in = f.name
-        tmp_out = tmp_in.replace('.png', '_resized.png')
-        
-        # Use PIL to resize
-        r = subprocess.run(
-            [COMFYUI_PY, '-c',
-             f'from PIL import Image; img=Image.open(r"{tmp_in}"); img.thumbnail(({max_size},{max_size})); img.save(r"{tmp_out}")'],
-            capture_output=True, text=True, timeout=30
-        )
-        os.unlink(tmp_in)
-        if r.returncode != 0 or not os.path.exists(tmp_out):
-            if os.path.exists(tmp_out):
-                os.unlink(tmp_out)
-            return None, image_data  # fallback to original
-        
-        with open(tmp_out, 'rb') as f:
-            resized = f.read()
-        os.unlink(tmp_out)
-        return resized, image_data
-    except Exception as e:
-        return None, image_data
+        if data:
+            tmp_win = os.path.join(
+                os.environ.get('TEMP', r'C:\Users\Joshua\AppData\Local\Temp'),
+                f'proxy_req_{os.getpid()}.json'
+            )
+            with open(tmp_win, 'w', encoding='utf-8') as f:
+                f.write(data)
+            # Windows path -> WSL path: C:\Users\... -> /mnt/c/Users/...
+            wsl_path = tmp_win.replace('\\', '/').replace('C:', '/mnt/c')
+            bash_cmd = (
+                'curl -s --max-time 900 -X POST '
+                '-H "Content-Type: application/json" '
+                f'-d @{wsl_path} '
+                f'http://localhost:11434{url}'
+            )
+            cmd = ['wsl', '-e', 'bash', '-c', bash_cmd]
+        else:
+            bash_cmd = f'curl -s --max-time 900 http://localhost:11434{url}'
+            cmd = ['wsl', '-e', 'bash', '-c', bash_cmd]
 
-def preprocess_vision_request(body_str):
-    """Find and resize large images in vision requests. Return modified body_str."""
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=920,
+            creationflags=CREATE_NO_WINDOW
+        )
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+    finally:
+        if tmp_win:
+            try:
+                os.unlink(tmp_win)
+            except Exception:
+                pass
+
+
+def resize_image(image_bytes, max_px=200):
+    """Resize image via ComfyUI PIL silently. Returns resized bytes or None."""
+    tmp_in = tmp_out = None
+    try:
+        tmp_in = tempfile.mktemp(suffix='.png')
+        tmp_out = tempfile.mktemp(suffix='.png')
+        with open(tmp_in, 'wb') as f:
+            f.write(image_bytes)
+        subprocess.run(
+            [COMFYUI_PYW, '-c',
+             f'from PIL import Image; img=Image.open(r"{tmp_in}"); img.thumbnail(({max_px},{max_px})); img.save(r"{tmp_out}")'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            creationflags=CREATE_NO_WINDOW
+        )
+        if os.path.exists(tmp_out):
+            with open(tmp_out, 'rb') as f:
+                data = f.read()
+            return data
+    except Exception:
+        pass
+    finally:
+        for f in (tmp_in, tmp_out):
+            if f:
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
+    return None
+
+
+def preprocess(body_str):
+    """Auto-resize images >50KB in vision requests."""
     try:
         data = json.loads(body_str)
-        modified = False
-        
-        def process_content(content):
-            nonlocal modified
-            if isinstance(content, list):
-                new_content = []
-                for item in content:
-                    if isinstance(item, dict) and item.get('type') == 'image_url':
-                        url = item.get('image_url', {}).get('url', '')
-                        if url.startswith('data:image/') and ';base64,' in url:
-                            b64_data = url.split(';base64,', 1)[1]
-                            try:
-                                img_bytes = base64.b64decode(b64_data)
-                                # Check if image is large (rough size check)
-                                if len(img_bytes) > 50000:  # > ~50KB likely too large
-                                    resized, _ = resize_image(img_bytes)
-                                    if resized and len(resized) < len(img_bytes):
-                                        mime = url.split(';base64,')[0] + ';base64,'
-                                        item['image_url']['url'] = mime + base64.b64encode(resized).decode()
-                                        modified = True
-                                        print(f'[proxy] Resized image {len(img_bytes)} -> {len(resized)} bytes')
-                            except Exception as e:
-                                pass  # keep original
-                    new_content.append(process_content(item))
-                return new_content
-            elif isinstance(content, dict):
-                return {k: process_content(v) for k, v in content.items()}
-            return content
-        
-        # Only process chat completion requests with images
-        if 'messages' in data:
-            for msg in data.get('messages', []):
-                if isinstance(msg.get('content'), list):
-                    msg['content'] = process_content(msg['content'])
-        
-        if modified:
-            return json.dumps(data, ensure_ascii=False)
-        return body_str
+        changed = False
+        for msg in data.get('messages', []):
+            content = msg.get('content', [])
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get('type') != 'image_url':
+                    continue
+                url = item.get('image_url', {}).get('url', '')
+                if not (url.startswith('data:image/') and ';base64,' in url):
+                    continue
+                try:
+                    b64 = url.split(';base64,', 1)[1]
+                    img_bytes = base64.b64decode(b64)
+                    if len(img_bytes) > MAX_VISION:
+                        resized = resize_image(img_bytes)
+                        if resized and len(resized) < len(img_bytes):
+                            item['image_url']['url'] = (
+                                url.split(';base64,')[0] + ';base64,' +
+                                base64.b64encode(resized).decode()
+                            )
+                            changed = True
+                except Exception:
+                    pass
+        return json.dumps(data, ensure_ascii=False) if changed else body_str
     except Exception:
         return body_str
 
-def curl_wsl(url, data=None, headers=None):
-    cmd = OLLAMA_WSL_CMD + [url]
-    if data:
-        cmd += ['-X', 'POST', '-H', 'Content-Type: application/json', '-d', data]
-    if headers:
-        for k, v in headers.items():
-            if k.lower() not in ('host', 'content-length'):
-                cmd += ['-H', f'{k}: {v}']
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=910)
-        if result.returncode == 0:
-            return result.stdout
-        return None
-    except:
-        return None
-
-def is_llm_running():
-    try:
-        r = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,name', '--format=csv,noheader'],
-                          capture_output=True, text=True, timeout=5)
-        return any('llama-server' in l for l in r.stdout.strip().split('\n') if l)
-    except:
-        return False
-
-def is_comfyui_active():
-    try:
-        r = subprocess.run(['curl', '-s', '--connect-timeout', '2',
-                          'http://localhost:8188/queue'],
-                          capture_output=True, text=True, timeout=4)
-        if r.returncode == 0:
-            data = json.loads(r.stdout)
-            return len(data.get('queue_running', [])) > 0 or len(data.get('queue_pending', [])) > 0
-        return False
-    except:
-        return False
 
 class Handler(BaseHTTPRequestHandler):
+    def send_json(self, body, status=200):
+        b = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(b))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def send_text(self, body, status=502):
+        b = body.encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', len(b))
+        self.end_headers()
+        self.wfile.write(b)
+
     def do_GET(self):
-        if self.path == '/v1/queue-status':
+        if self.path == '/v1/ollama-ready':
+            resp = curl_wsl('/api/tags')
+            self.send_json({'status': 'ok' if resp else 'down'},
+                          200 if resp else 503)
+        elif self.path == '/v1/queue-status':
+            self.send_json({'status': 'ok'})
+        elif self.path == '/v1/models':
+            resp = curl_wsl('/v1/models')
+            if resp:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(resp.encode())
+            else:
+                self.send_text('Ollama unavailable', 502)
+        else:
+            self.send_text('Not found', 404)
+
+    def do_POST(self):
+        if not self.path.startswith('/v1/'):
+            self.send_text('Not found', 404)
+            return
+
+        cl = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(cl)
+        body_str = preprocess(body.decode('utf-8', errors='replace'))
+
+        resp = curl_wsl(self.path, data=body_str)
+        if resp:
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            resp = {'gpu_free': not is_llm_running(), 'comfyui_active': is_comfyui_active()}
-            self.wfile.write(json.dumps(resp).encode())
-        elif self.path == '/v1/models':
-            resp = curl_wsl('http://localhost:11434/v1/models')
-            if resp:
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(resp.encode())
-            else:
-                self.send_response(502)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'WSL Ollama unavailable')
-        elif self.path == '/v1/ollama-ready':
-            # Health check for Ollama
-            resp = curl_wsl('http://localhost:11434/api/tags')
-            if resp:
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"status":"ok"}')
-            else:
-                self.send_response(503)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'Ollama unavailable')
+            self.wfile.write(resp.encode())
         else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        if self.path.startswith('/v1/chat/completions'):
-            # Wait for ComfyUI to be free
-            while is_comfyui_active():
-                time.sleep(2)
-            while is_llm_running():
-                time.sleep(2)
-
-            cl = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(cl)
-            body_str = body.decode('utf-8', errors='replace')
-
-            # Pre-process vision requests (resize large images)
-            body_str = preprocess_vision_request(body_str)
-
-            # Forward via WSL curl
-            url = 'http://localhost:11434/v1/chat/completions'
-            resp = curl_wsl(url, data=body_str)
-
-            if resp:
-                try:
-                    resp_json = json.loads(resp)
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', len(json.dumps(resp_json).encode()))
-                    self.end_headers()
-                    self.wfile.write(json.dumps(resp_json).encode())
-                except:
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.send_header('Content-Length', len(resp))
-                    self.end_headers()
-                    self.wfile.write(resp.encode())
-            else:
-                self.send_response(502)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'WSL Ollama unavailable')
-
-        elif self.path.startswith('/v1/'):
-            # Other v1 routes (embeddings, etc.)
-            cl = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(cl)
-            url = 'http://localhost:11434/v1/' + self.path[4:]
-            resp = curl_wsl(url, data=body.decode('utf-8', errors='replace'))
-            if resp:
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(resp.encode())
-            else:
-                self.send_response(502)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'WSL Ollama unavailable')
-        else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_text('Ollama unavailable', 502)
 
     def log_message(self, fmt, *args):
-        # Suppress log noise - print important stuff only
-        if 'resize' in str(args) or 'vision' in str(args):
-            print(args[0] % args[1:])
+        pass
+
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
-print('Proxy on 9000 -> WSL Ollama (with vision image resizing)')
-ThreadedHTTPServer(('0.0.0.0', 9000), Handler).serve_forever()
+
+if __name__ == '__main__':
+    print('Proxy: 9000 -> WSL Ollama  |  vision auto-resize enabled')
+    try:
+        ThreadedHTTPServer(('0.0.0.0', 9000), Handler).serve_forever()
+    except KeyboardInterrupt:
+        pass
