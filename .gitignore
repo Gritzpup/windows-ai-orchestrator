@@ -1,0 +1,52 @@
+# Environment files with secrets
+*.env
+.env
+.env.local
+
+# API keys and auth
+*auth*.json
+*credential*
+
+# Test outputs
+*.png
+*.jpg
+*.webp
+*.mp4
+*.webm
+output/
+
+# Windows temp files
+*.tmp
+*.log
+*.bak
+
+# WSL large models
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node modules
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ComfyUI database and session files
+*.db
+*.db.lock
+
+# Downloaded models (too large for git)
+*.blob
+models/
+checkpoints/
+diffusion_models/
