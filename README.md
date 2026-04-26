@@ -151,3 +151,38 @@ wsl -e bash -c "pkill -9 ollama; OLLAMA_HOST=0.0.0.0 nohup ollama serve > /tmp/o
 ### WSL network issues
 - The proxy uses `wsl curl` forwarding to bypass direct Windows→WSL HTTP
 - If Ollama still fails, check WSL: `wsl --shutdown && wsl`
+
+## Vision Resize (Auto-handled by proxy)
+
+The proxy automatically resizes large images before sending to the vision model (qwen2.5vl:7b). Images over ~50KB are resized to max 200x200 using ComfyUI's PIL.
+
+```python
+# Just send any image - proxy handles resizing automatically:
+data = {
+    "model": "qwen2.5vl:7b",
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What's in this image?"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+    ]}]
+}
+# Proxy auto-resizes large images before forwarding to Ollama
+```
+
+## Repo Structure
+```
+windows-ai-orchestrator/
+├── windows/
+│   └── proxy.py           # GPU-aware proxy (Windows)
+├── wsl/
+│   └── model-orch.sh     # GPU model orchestrator (WSL)
+├── scripts/
+│   ├── start_all.ps1     # Start all services
+│   ├── start-bonsai.sh   # Start Bonsai servers
+│   └── *.bat             # Windows launcher scripts
+├── pi-agent/
+│   └── models.json       # Pi agent model config
+├── docs/
+│   └── STATUS.md         # Full system documentation
+├── BONSAI_SETUP.md
+└── README.md
+```
